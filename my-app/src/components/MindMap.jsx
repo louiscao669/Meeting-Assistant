@@ -1,4 +1,4 @@
-import React, { useState, useEffect, use } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ReactFlow, ReactFlowProvider, Background, Controls, Handle, Position } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { Dialog, DialogTitle, DialogContent } from '@mui/material';
@@ -7,7 +7,12 @@ import CloseIcon from '@mui/icons-material/Close';
 import InputKeywords from './InputKeywords';
 import Transcript from './Transcript';
 // import jsonData from '../data/nodesAndEdges.json';
-import { getOpenAIResponse } from '../data/callOpenai';
+import { getOpenAIResponse } from './callLLM';
+import {
+  getMaxNodeId,
+  parseMindMapResponse,
+  validateIncrementalUpdate,
+} from '../utils/mindMapTree';
 
 // Custom node with right-side handle
 const RightHandleNode = ({ data }) => {
@@ -92,99 +97,205 @@ const nodeTypes = {
   rightHandle: RightHandleNode,
 };
 
+/** Wait after the last transcript edit before calling the LLM. */
+const TRANSCRIPT_DEBOUNCE_MS = 2500;
+/** Also update at least this often while speech keeps changing. */
+const TRANSCRIPT_MAX_INTERVAL_MS = 8000;
+
+function buildMindMapPrompt({
+  existingMap,
+  newTranscript,
+  activeLeafId,
+  nextNodeId,
+  isInitial,
+}) {
+  const activeLeafLine =
+    activeLeafId != null
+      ? `The current active leaf (ongoing point) is node id ${activeLeafId}.`
+      : 'There is no active leaf yet — this is the first update.';
+
+  return `
+You incrementally update a meeting mind map. Each update must preserve every existing node exactly as-is, except you may extend the active leaf's transcript or add new nodes.
+
+${activeLeafLine}
+Use new node ids starting at ${nextNodeId} (never reuse or change existing ids).
+
+<Immutable rules — violations will be discarded>
+1. Do NOT change id, label, parent, or transcript on any existing node EXCEPT the active leaf (id ${activeLeafId ?? 'none'}), whose transcript may grow or be refined.
+2. Do NOT delete nodes or move nodes between parents.
+3. Do NOT edit labels on nodes that already exist.
+
+<When speakers are still on the SAME point>
+- Append or refine ONLY the active leaf's "transcript" field with the new speech.
+- Do not add sibling or child nodes.
+
+<When speakers have moved to a NEW point>
+1. Decide if this is truly a new topic/point (not just more detail on the same point).
+2. Choose where to branch:
+   a) Sibling branch (parallel to current thread): add a new leaf as another child of the active leaf's PARENT — use when the meeting advances to a new point while staying under the same topic.
+   b) Deeper branch: add a new leaf as a child of the active leaf — use when the new point is a sub-point of what was just discussed.
+   c) Earlier branch: add a new leaf under an EARLIER topic node (not the active leaf) — use when speakers returned to or continued a prior thread; create a sibling next to that thread's existing leaves.
+3. New leaf: brief "label", "transcript" = only what was said about this new point in the new transcript below (you may expand later on subsequent updates when it becomes the active leaf).
+4. Set "activeLeafId" in your response to the id of the leaf now being discussed.
+
+<Mind map shape>
+- Roots: topic nodes with "children" only (no transcript on roots unless a root is also a leaf in your tree).
+- Leaves: have "transcript"; may have "children" if you branch deeper later.
+[
+  {
+    "id": 1,
+    "label": "Brief topic",
+    "children": [
+      {
+        "id": 2,
+        "label": "Brief sub-point",
+        "transcript": "What was said for this point so far"
+      }
+    ]
+  }
+]
+
+<Existing mind map — frozen except active leaf rules above>
+${JSON.stringify(existingMap)}
+
+<New transcript since last update${isInitial ? ' (full meeting so far)' : ''}>
+${newTranscript}
+
+Return ONLY valid JSON:
+{
+  "activeLeafId": <number>,
+  "mindMap": [ ...complete forest... ]
+}
+If the new transcript is empty noise or unrelated, return the existing mind map unchanged with the same activeLeafId.
+`.trim();
+}
+
 const MindMap = () => {
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
-  const [transcript, setTranscript] = useState(""); // State to hold transcript content
-  const [time, setTime] = useState(0); // State to hold time
+  const [transcript, setTranscript] = useState("");
+  const [time, setTime] = useState(0);
   const [selectedTranscript, setSelectedTranscript] = useState('');
   const [open, setOpen] = useState(false);
   const [structuredData, setStructuredData] = useState([]);
-
-  // useEffect(() => {
-  //   // Filter entries from jsonData where the item's time is <= current time
-  //   const visibleItems = jsonData.filter(item => item.time <= time);
-  
-  //   // Build nodes and edges arrays
-  //   const newNodes = visibleItems.map(item => ({
-  //     ...item.node,
-  //     type: 'rightHandle'
-  //   }));
-  
-  //   const newEdges = visibleItems
-  //     .map(item => item.edge)
-  //     .filter(edge => Object.keys(edge).length > 0); // Remove empty edge objects
-  
-  //   setNodes(newNodes);
-  //   setEdges(newEdges);
-  // }, [time]);
+  const structuredDataRef = useRef(structuredData);
+  const activeLeafIdRef = useRef(null);
+  const transcriptRef = useRef(transcript);
+  const processedTranscriptLengthRef = useRef(0);
+  const lastSyncAtRef = useRef(0);
+  const syncInFlightRef = useRef(false);
+  const pendingSyncRef = useRef(false);
 
   useEffect(() => {
-    if (time % 5 !== 4) 
-      return;
-    // console.log('Current Transcript:', transcript);
-    // Call OpenAI API when transcript changes
-    const prompt = `
-      You are a dynamic mind map generator for a meeting's contents.
-      You will receive an existing mind map and an updated version of transcript.
-      Your task is to generate an updated mind map based on the transcript.
-      Mind map format, original mind map, and updated transcript are provided below.
-      ------------------------------------------\n
-      <Mind Map Format: start>:\n
-      [
-        {
-          id: int (Node ID),
-          label: string (Topic, should be a very brief title),
-          children: [
-            {
-              id: int (Node ID),
-              label: string (Sub Topic, should be a very brief summary),
-              transcript: "This is the portion of transcript for Sub Topic 1",
-            },
-            {
-              id: int (Node ID),
-              label: string (Sub Topic, should be a very brief summary),
-              transcript: "This is the portion of transcript for Sub Topic 2",
-            }
-          ]
-        }
-      ]
-      <Mind Map Format: end>\n
-      --------------------------------------------\n
-      <Original Mind Map: start>:
-      ${JSON.stringify(structuredData)}
-      <Original Mind Map: end>\n
-      --------------------------------------------\n
-      <Updated Meeting Transcript: start>:
-      ${transcript}
-      <Original Meeting Transcript: end>\n
-      --------------------------------------------\n
-      <Note>:
-      1. DO NOT CHANGE the existing mind map structure (you can edit the transcript, but not label of leaves).
-      2. You DON'T have to make a change. If the updated part of transcript is not related to the meeting at all, please return the original mind map.
-      3. You CAN change the labels of the root node, or add new root nodes when suitable.
-      4. If a leaf node has a very long transcript, you can split it into multiple sub-nodes.
-      4. Return ONLY the JSON format mind map (list of dictionary).
-    `;
-    try {
-      const ProcessTranscript = async () => {
-        const data = await getOpenAIResponse(prompt);
-        console.log('Processed Transcript:\n', data);
-        if (!data || data.length === 0) {
+    structuredDataRef.current = structuredData;
+  }, [structuredData]);
+
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
+  useEffect(() => {
+    const transcriptText = transcript.trim();
+    if (!transcriptText) return;
+
+    let cancelled = false;
+    let debounceTimer;
+    let maxIntervalTimer;
+
+    const applyMindMap = (mindMap, activeLeafId) => {
+      setStructuredData(mindMap);
+      activeLeafIdRef.current = activeLeafId;
+      const { nodes: newNodes, edges: newEdges } = convertToFlow(mindMap);
+      setNodes(newNodes);
+      setEdges(newEdges);
+    };
+
+    const runSync = async () => {
+      if (syncInFlightRef.current) {
+        pendingSyncRef.current = true;
+        return;
+      }
+
+      const fullText = transcriptRef.current.trim();
+      if (!fullText) return;
+
+      const existingMap = structuredDataRef.current;
+      const isInitial = existingMap.length === 0;
+      const delta = isInitial
+        ? fullText
+        : fullText.slice(processedTranscriptLengthRef.current).trim();
+
+      if (!delta && !isInitial) return;
+
+      syncInFlightRef.current = true;
+      try {
+        const prompt = buildMindMapPrompt({
+          existingMap,
+          newTranscript: delta,
+          activeLeafId: activeLeafIdRef.current,
+          nextNodeId: getMaxNodeId(existingMap) + 1,
+          isInitial,
+        });
+        const raw = await getOpenAIResponse(prompt);
+        if (cancelled) return;
+
+        if (!raw?.length) {
           console.error('No data returned from OpenAI API');
           return;
         }
-        const parsed = JSON.parse(data);
-        setStructuredData(parsed);
-        const { nodes: newNodes, edges: newEdges } = convertToFlow(parsed);
-        setNodes(newNodes);
-        setEdges(newEdges);
-      };
-      ProcessTranscript();
-    }
-    catch (error) {
-      console.error('Error structurelizing transcript:', error);
-    }
+
+        const { mindMap, activeLeafId } = parseMindMapResponse(raw);
+        const validation = validateIncrementalUpdate(
+          existingMap,
+          mindMap,
+          activeLeafIdRef.current,
+        );
+
+        if (!validation.ok) {
+          console.warn('Mind map update rejected:', validation.reason);
+          return;
+        }
+
+        applyMindMap(
+          validation.mindMap,
+          activeLeafId ?? activeLeafIdRef.current,
+        );
+        processedTranscriptLengthRef.current = fullText.length;
+        lastSyncAtRef.current = Date.now();
+      } catch (error) {
+        if (!cancelled) {
+          console.error('Error updating mind map from transcript:', error);
+        }
+      } finally {
+        syncInFlightRef.current = false;
+        if (!cancelled && pendingSyncRef.current) {
+          pendingSyncRef.current = false;
+          runSync();
+        }
+      }
+    };
+
+    const scheduleSync = () => {
+      window.clearTimeout(debounceTimer);
+      window.clearTimeout(maxIntervalTimer);
+
+      debounceTimer = window.setTimeout(runSync, TRANSCRIPT_DEBOUNCE_MS);
+
+      const elapsed = Date.now() - lastSyncAtRef.current;
+      const maxDelay =
+        lastSyncAtRef.current === 0
+          ? TRANSCRIPT_MAX_INTERVAL_MS
+          : Math.max(0, TRANSCRIPT_MAX_INTERVAL_MS - elapsed);
+      maxIntervalTimer = window.setTimeout(runSync, maxDelay);
+    };
+
+    scheduleSync();
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(debounceTimer);
+      window.clearTimeout(maxIntervalTimer);
+    };
   }, [transcript]);
 
   const handleNodeClick = (event, node) => {
@@ -199,32 +310,30 @@ const MindMap = () => {
       {/* Gradient Stripe with Logo */}
       <Box
         sx={{
-          height: '50px', // Adjust height as needed
-          background: 'linear-gradient(to right,rgb(133, 62, 208),rgb(53, 109, 207))', // Gradient
+          height: 40,
+          minHeight: 40,
+          flexShrink: 0,
+          background: 'linear-gradient(to right,rgb(133, 62, 208),rgb(53, 109, 207))',
           display: 'flex',
           alignItems: 'center',
-          justifyContent: 'center', // Center logo horizontally
-          padding: '0 20px', // Add some padding
-          flex: 1,
-          position: 'relative'
+          justifyContent: 'center',
+          px: 2,
         }}
       >
         <img
-          src="src/assets/MindEcho.svg" // Replace with your logo path
-          alt="Logo"
-          style={{ height: '80px', width: '200px' }} // Adjust logo size
+          src="src/assets/MindEcho.svg"
+          alt="MindEcho"
+          style={{ height: 28, width: 'auto', maxWidth: 140 }}
         />
       </Box>
 
-      <Box sx={{ display: 'flex', flexDirection: 'row', width: '100%', flexGrow: 1 }}>
-        {/* Input Keywords Section */}
-        <Box sx={{ flex: 1}}>
+      <Box sx={{ display: 'flex', flexDirection: 'row', width: '100%', flex: 1, minHeight: 0 }}>
+        <Box sx={{ flex: 1, minWidth: 280, minHeight: 0, overflow: 'auto' }}>
           <InputKeywords transcript={transcript} />
         </Box>
 
-        {/* Map Content */}
-        <Box sx={{ display: 'flex', flexDirection: 'column', flex: 2 }}>
-          <Box sx={{ flex: 1, position: 'relative'}}>
+        <Box sx={{ display: 'flex', flexDirection: 'column', flex: 2, minHeight: 0 }}>
+          <Box sx={{ flex: 1, minHeight: 120, position: 'relative' }}>
             <ReactFlowProvider>
               <ReactFlow
                 nodes={nodes}

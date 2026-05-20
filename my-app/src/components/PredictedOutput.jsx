@@ -1,52 +1,60 @@
 import React, { useEffect, useState } from 'react';
 import { Box, Typography, Paper, Button } from '@mui/material';
-import { getOpenAIResponse } from '../data/callOpenai';
+import { getOpenAIResponse } from './callLLM';
 
 const PredictedOutput = ({ keywords, transcript, predict, setPredict }) => {
-  const [prediction, setPrediction] = useState(' ');
+  const [prediction, setPrediction] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    if (!predict || keywords.length === 0 || !transcript) {
-      return; // Do not fetch if prediction is not triggered or there's no input
+    if (!predict) return;
+
+    if (keywords.length === 0) {
+      setError('Add at least one keyword (press Enter after typing).');
+      setPredict(false);
+      return;
     }
+
+    const transcriptText = (transcript || '').trim();
+    const meetingContext = transcriptText
+      ? transcriptText
+      : '(No meeting transcript yet — use the keywords and general meeting context.)';
 
     const fetchPrediction = async () => {
       setLoading(true);
       setError(null);
 
       try {
-        // Use environment variable to access the API key
         const prompt = `
-            Assume you are a user currently in a meeting. 
-            <Meeting transcript>: 
-            ${transcript}
+            Assume you are a user currently in a meeting.
+            <Meeting transcript>:
+            ${meetingContext}
 
             You are to express your views based on the transcript above and the keywords provided.
-            <Keywords>: 
+            <Keywords>:
             ${keywords.join(', ')}
-            
-            Note: 
-            1. Use the FIRST PERSON to express your views. 
+
+            Note:
+            1. Use the FIRST PERSON to express your views.
             2. Limit your output within 2-3 sentences.
-            3. Focus on more recent transcript lines.
+            3. Focus on more recent transcript lines when a transcript is available.
             4. Make sure your output is relevant to the keywords provided.
         `;
-        // console.log('Prompt:', prompt);
         const data = await getOpenAIResponse(prompt);
         setPrediction(data);
       } catch (err) {
-        setError('Error fetching the prediction');
+        const message = err?.message || 'Error fetching the prediction';
+        setError(message);
         console.error('OpenAI API Error:', err);
       } finally {
         setLoading(false);
+        setPredict(false);
       }
     };
 
     fetchPrediction();
-    setPredict(false); // Reset 'predict' state after prediction is made
-  }, [keywords, transcript, predict]); // Re-run the request when keywords, transcript, or predict changes
+  }, [keywords, transcript, predict, setPredict]);
 
   useEffect(() => {
     console.log('Prediction:', prediction);
@@ -64,15 +72,22 @@ const PredictedOutput = ({ keywords, transcript, predict, setPredict }) => {
     if (prediction) {
       const speech = new SpeechSynthesisUtterance(prediction);
       speech.lang = 'en-US';
-      speech.rate = 2;
+      speech.rate = 1; // 1 = normal; was 2 (too fast)
       window.speechSynthesis.speak(speech);
     }
   };
 
   return (
     <Box sx={{ padding: 0, marginTop: 2 }}>
-      {error && <Typography color="error">{error}</Typography>}
-      {prediction && (
+      {loading && (
+        <Typography sx={{ color: '#555', mt: 1 }}>Organizing your thoughts…</Typography>
+      )}
+      {error && (
+        <Typography color="error" sx={{ mt: 1, fontSize: '0.875rem' }}>
+          {error}
+        </Typography>
+      )}
+      {prediction.trim() && (
         <Paper
             sx={{
             display: 'flex',
@@ -103,7 +118,6 @@ const PredictedOutput = ({ keywords, transcript, predict, setPredict }) => {
             >
                 Speak
             </Button>
-            {loading && <Typography color='white'>Loading...</Typography>}
             <Typography
             color="white"
             sx={{

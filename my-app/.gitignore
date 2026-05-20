@@ -26,3 +26,5 @@ dist-ssr
 # ignore data files
 data
 .env*
+
+Hackathon25.key

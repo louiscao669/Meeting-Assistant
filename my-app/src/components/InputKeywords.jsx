@@ -1,5 +1,5 @@
 // src/components/InputKeywords.jsx
-import React, { useState, useEffect, use } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Box, TextField, Typography, Chip, Button, Paper } from '@mui/material';
 import PredictedOutput from './PredictedOutput'; // Import the new component
 
@@ -18,18 +18,33 @@ const InputKeywords = ({ transcript }) => {
     setInput(e.target.value);
   };
 
-  // Handle 'Enter' key press to add keyword
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && input.trim() !== '') {
-      setKeywords((prevKeywords) => [...prevKeywords, input.trim()]);
-      setInput(''); // Clear the input field after adding
+  const addKeyword = (value) => {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    setKeywords((prev) => [...prev, trimmed]);
+    setInput('');
+  };
+
+  // Enter adds a chip; Shift+Enter keeps a newline in the multiline field
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      addKeyword(input);
     }
   };
 
-  // Trigger prediction on button click
   const handlePredictClick = () => {
-    setPredict(true); // Set to true to trigger prediction
+    let nextKeywords = keywords;
+    if (input.trim()) {
+      nextKeywords = [...keywords, input.trim()];
+      setKeywords(nextKeywords);
+      setInput('');
+    }
+    if (nextKeywords.length === 0) return;
+    setPredict(true);
   };
+
+  const canOrganize = keywords.length > 0 || input.trim().length > 0;
 
   useEffect(() => {
     console.log('Keywords:', keywords);
@@ -54,7 +69,7 @@ const InputKeywords = ({ transcript }) => {
         rows={2}  // Shrinking the height of the input block
         value={input}
         onChange={handleInputChange}
-        onKeyDown={handleKeyPress} // Detect "Enter" key press
+        onKeyDown={handleKeyDown}
         sx={{
           marginBottom: 2,
           backgroundColor: '#fff', // Make the input field white for contrast
@@ -126,10 +141,14 @@ const InputKeywords = ({ transcript }) => {
               backgroundColor: 'rgb(133, 62, 208)', // grey-ish
             },
           }}
-          disabled={keywords.length === 0} // Disable if no keywords entered
+          disabled={!canOrganize}
         >
           Organize my thoughts!
         </Button>
+        <Typography variant="caption" display="block" sx={{ mt: 1, color: '#666' }}>
+          Type keywords and press Enter, or click the button to use what you typed.
+          Play a video or speak to fill the meeting transcript (optional).
+        </Typography>
       </Box>
 
       {/* Predicted Output below the keywords */}
